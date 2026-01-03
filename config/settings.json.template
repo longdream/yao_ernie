@@ -1,0 +1,40 @@
+{
+  "provider": "openai",
+  "baseUrl": "https://api.openai.com/v1",
+  "apiKey": "your-api-key-here",
+  "model": "gpt-3.5-turbo",
+  "models": [
+    {
+      "name": "ernie-4.5-turbo-128k-preview",
+      "provider": "openai",
+      "baseUrl": "https://aistudio.baidu.com/llm/lmapi/v3",
+      "category": "advanced",
+      "supportsVision": false,
+      "apiKey": "your-baidu-api-key"
+    },
+    {
+      "name": "ernie-4.5-turbo-vl",
+      "provider": "openai",
+      "baseUrl": "https://aistudio.baidu.com/llm/lmapi/v3",
+      "category": "vl",
+      "supportsVision": true,
+      "apiKey": "your-baidu-api-key"
+    }
+  ],
+  "vlModel": "ernie-4.5-turbo-vl",
+  "lightModel": "ernie-4.5-turbo-128k-preview",
+  "advancedModel": "ernie-4.5-turbo-128k-preview",
+  "streamingEnabled": true,
+  "defaultThink": false,
+  "maxContextMessages": 20,
+  "temperature": 0.7,
+  "language": "zh",
+  "mcpServers": [],
+  "mcpServerInfos": {},
+  "mcpMaxRetries": 3,
+  "mcpReflectionEnabled": true,
+  "embeddingUrl": "https://api.siliconflow.cn/v1/embeddings",
+  "embeddingModel": "BAAI/bge-m3",
+  "embeddingApiKey": "your-embedding-api-key"
+}
+

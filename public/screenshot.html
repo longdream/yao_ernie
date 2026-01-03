@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Screenshot</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            cursor: crosshair; 
+            background: #000;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        .screenshot-container {
+            position: fixed;
+            inset: 0;
+            z-index: 1;
+        }
+        .screenshot-image {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            user-select: none;
+            pointer-events: none;
+        }
+        .selection {
+            position: absolute;
+            border: 2px solid #3b82f6;
+            background: rgba(59, 130, 246, 0.1);
+            box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
+            pointer-events: none;
+            z-index: 100;
+            cursor: crosshair;
+        }
+        .selection::before {
+            content: '';
+            position: absolute;
+            inset: -1px;
+            border: 1px solid rgba(255, 255, 255, 0.8);
+            pointer-events: none;
+        }
+        .toolbar {
+            position: absolute;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+        .toolbar button {
+            width: 40px;
+            height: 40px;
+            border: 1px solid #e5e7eb;
+            border-radius: 50%;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: white;
+            color: #374151;
+        }
+        .toolbar button:hover { 
+            background: #f9fafb;
+        }
+        .toolbar button svg {
+            width: 16px;
+            height: 16px;
+            stroke: currentColor;
+            fill: none;
+            stroke-width: 2;
+        }
+        .instructions {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 16px;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <div class="screenshot-container">
+        <img id="screenshotImage" class="screenshot-image" alt="Screenshot" />
+        <div class="instructions" id="instructions">拖拽选择截图区域，ESC键取消</div>
+    </div>
+    
+    <script>
+        console.log('📸 Screenshot window initialized');
+        console.log('🔧 Tauri APIs available:', {
+            core: typeof window.__TAURI__?.core,
+            event: typeof window.__TAURI__?.event
+        });
+        
+        let isSelecting = false;
+        let startX = 0;
+        let startY = 0;
+        let selection = null;
+        let selectionDiv = null;
+        let toolbar = null;
+        
+        // 监听来自Rust的截图数据
+        if (window.__TAURI__ && window.__TAURI__.event) {
+            window.__TAURI__.event.listen('screenshot-data', (event) => {
+                console.log('收到截图数据事件');
+                console.log('数据长度:', event.payload.base64Data ? event.payload.base64Data.length : 'undefined');
+                
+                const screenshotImage = document.getElementById('screenshotImage');
+                if (screenshotImage && event.payload.base64Data) {
+                    const dataUrl = `data:image/jpeg;base64,${event.payload.base64Data}`;
+                    console.log('设置图像源，数据URL长度:', dataUrl.length);
+                    
+                    screenshotImage.onload = function() {
+                        console.log('✅ 图像加载成功:', screenshotImage.naturalWidth, 'x', screenshotImage.naturalHeight);
+                    };
+                    
+                    screenshotImage.onerror = function(error) {
+                        console.error('❌ 图像加载失败:', error);
+                        alert('图像加载失败，请检查控制台');
+                    };
+                    
+                    screenshotImage.src = dataUrl;
+                } else {
+                    console.error('❌ 没有收到有效的截图数据');
+                    alert('没有收到有效的截图数据');
+                }
+            });
+            
+            console.log('✅ 事件监听器已设置');
+        } else {
+            console.error('❌ Tauri事件API不可用');
+            alert('Tauri事件API不可用');
+        }
+        
+        // 鼠标事件处理
+        document.addEventListener('mousedown', (e) => {
+            if (e.button === 0) {
+                e.preventDefault();
+                isSelecting = true;
+                startX = e.clientX;
+                startY = e.clientY;
+                
+                // 移除之前的选择
+                if (selectionDiv) {
+                    selectionDiv.remove();
+                    selectionDiv = null;
+                }
+                if (toolbar) {
+                    toolbar.remove();
+                    toolbar = null;
+                }
+                
+                // 隐藏提示
+                const instructions = document.querySelector('.instructions');
+                if (instructions) instructions.style.display = 'none';
+                
+                selection = null;
+                console.log('Selection started at:', startX, startY);
+            }
+        });
+        
+        document.addEventListener('mousemove', (e) => {
+            if (isSelecting) {
+                e.preventDefault();
+                const currentX = e.clientX;
+                const currentY = e.clientY;
+                
+                const x = Math.min(startX, currentX);
+                const y = Math.min(startY, currentY);
+                const width = Math.abs(currentX - startX);
+                const height = Math.abs(currentY - startY);
+                
+                if (width > 3 || height > 3) {
+                    if (!selectionDiv) {
+                        selectionDiv = document.createElement('div');
+                        selectionDiv.className = 'selection';
+                        document.body.appendChild(selectionDiv);
+                    }
+                    
+                    selectionDiv.style.left = x + 'px';
+                    selectionDiv.style.top = y + 'px';
+                    selectionDiv.style.width = width + 'px';
+                    selectionDiv.style.height = height + 'px';
+                    selectionDiv.style.display = 'block';
+                    
+                    selection = { x, y, width, height };
+                }
+            }
+        });
+        
+        document.addEventListener('mouseup', (e) => {
+            if (isSelecting) {
+                isSelecting = false;
+                
+                const currentX = e.clientX;
+                const currentY = e.clientY;
+                const x = Math.min(startX, currentX);
+                const y = Math.min(startY, currentY);
+                const width = Math.abs(currentX - startX);
+                const height = Math.abs(currentY - startY);
+                
+                if (width > 10 && height > 10) {
+                    selection = { x, y, width, height };
+                    showToolbar();
+                } else {
+                    if (selectionDiv) {
+                        selectionDiv.remove();
+                        selectionDiv = null;
+                    }
+                    selection = null;
+                    
+                    const instructions = document.querySelector('.instructions');
+                    if (instructions) instructions.style.display = 'block';
+                }
+            }
+        });
+        
+        function showToolbar() {
+            if (!selection) return;
+            
+            toolbar = document.createElement('div');
+            toolbar.className = 'toolbar';
+            
+            let toolbarX = selection.x + selection.width + 10;
+            let toolbarY = selection.y + selection.height + 10;
+            
+            if (toolbarX > window.innerWidth - 200) {
+                toolbarX = selection.x - 200;
+            }
+            if (toolbarY > window.innerHeight - 50) {
+                toolbarY = selection.y - 50;
+            }
+            
+            toolbar.style.left = Math.max(10, toolbarX) + 'px';
+            toolbar.style.top = Math.max(10, toolbarY) + 'px';
+            toolbar.style.zIndex = '1000';
+            
+            toolbar.innerHTML = `
+                <button onclick="confirmSelection()" title="确认">
+                    <svg viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
+                    </svg>
+                </button>
+                <button onclick="cancelSelection()" title="取消">
+                    <svg viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            `;
+            
+            document.body.appendChild(toolbar);
+        }
+        
+        async function confirmSelection() {
+            if (selection) {
+                try {
+                    const result = await window.__TAURI__.core.invoke('save_screenshot_area', {
+                        x: Math.round(selection.x),
+                        y: Math.round(selection.y),
+                        width: Math.round(selection.width),
+                        height: Math.round(selection.height)
+                    });
+                    
+                    await window.__TAURI__.event.emit('screenshot-result', {
+                        success: true,
+                        image: result,
+                        dimensions: {
+                            width: Math.round(selection.width),
+                            height: Math.round(selection.height)
+                        }
+                    });
+                    
+                    await window.__TAURI__.core.invoke('close_screenshot_window');
+                } catch (error) {
+                    console.error('截图处理失败:', error);
+                    alert('截图处理失败: ' + error.toString());
+                }
+            }
+        }
+        
+        async function cancelSelection() {
+            try {
+                if (window.__TAURI__ && window.__TAURI__.event) {
+                    await window.__TAURI__.event.emit('screenshot-result', {
+                        success: false,
+                        cancelled: true
+                    });
+                }
+                
+                if (window.__TAURI__ && window.__TAURI__.core) {
+                    await window.__TAURI__.core.invoke('close_screenshot_window');
+                } else {
+                    window.close();
+                }
+            } catch (error) {
+                console.error('取消截图失败:', error);
+                window.close();
+            }
+        }
+        
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                cancelSelection();
+            } else if (e.key === 'Enter' && selection) {
+                confirmSelection();
+            }
+        });
+    </script>
+</body>
+</html>

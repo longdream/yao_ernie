@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/capabilities.json",
+  "identifier": "screenshot-capability",
+  "description": "Screenshot overlay window capabilities",
+  "windows": ["screenshot-overlay"],
+  "permissions": [
+    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit"
+  ]
+}

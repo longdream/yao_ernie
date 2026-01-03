@@ -1,0 +1,989 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use anyhow::Result;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::io::Write as _;
+use tauri::Manager;
+use tauri::Window;
+use tauri::Emitter;
+use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
+use enigo::{Enigo, Key, Keyboard, Settings};
+use std::sync::{Arc, Mutex};
+use xcap::Monitor;
+use base64::{Engine as _, engine::general_purpose};
+use image::ImageFormat;
+
+// 全局光标位置存储
+static CURSOR_POSITION: std::sync::OnceLock<Arc<Mutex<Option<(i32, i32)>>>> = std::sync::OnceLock::new();
+
+
+// 全局应用句柄存储
+static APP_HANDLE: std::sync::OnceLock<Arc<Mutex<Option<tauri::AppHandle>>>> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetWindowsHookExW, CallNextHookEx, WH_MOUSE_LL, WM_LBUTTONDOWN, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{POINT, WPARAM, LPARAM, LRESULT, HINSTANCE};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, GetAsyncKeyState};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelConfig {
+  pub name: String,
+  pub provider: String,
+  pub base_url: String,
+  pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppConfig {
+  pub provider: String,
+  pub base_url: String,
+  pub api_key: Option<String>,
+  pub model: Option<String>,
+  #[serde(default)]
+  pub models: Option<Vec<ModelConfig>>,
+  #[serde(default)]
+  pub streaming_enabled: Option<bool>,
+  #[serde(default)]
+  pub default_think: Option<bool>,
+  #[serde(default)]
+  pub max_context_messages: Option<u32>,
+  #[serde(default)]
+  pub temperature: Option<f64>,
+}
+
+#[tauri::command]
+async fn proxy_models(config: AppConfig) -> Result<String, String> {
+  let client = Client::new();
+  let url = format!("{}/v1/models", config.base_url.trim_end_matches('/'));
+  let mut req = client.get(url);
+  if let Some(k) = config.api_key {
+    req = req.bearer_auth(k);
+  }
+  let resp = req.send().await.map_err(|e| e.to_string())?;
+  let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+  let list = v.get("data").and_then(|m| m.as_array()).map(|arr| {
+    arr.iter()
+      .filter_map(|m| m.get("id").and_then(|n| n.as_str()).map(|s| s.to_string()))
+      .collect::<Vec<String>>()
+  }).unwrap_or_default();
+  let result = serde_json::to_string(&list).map_err(|e| e.to_string())?;
+  Ok(result)
+}
+
+#[tauri::command]
+async fn proxy_chat_stream(body: String) -> Result<String, String> {
+  // Return the body handle string back for processing
+  Ok(body)
+}
+
+#[tauri::command]
+async fn proxy_chat(handle: String) -> Result<String, String> {
+  #[derive(Deserialize)]
+  struct InBody { config: AppConfig, messages: Vec<Message>, model: String, #[serde(default)] think: bool }
+  let parsed: InBody = serde_json::from_str(&handle).map_err(|e| e.to_string())?;
+  chat_once(parsed.config, parsed.messages, parsed.model, parsed.think).await.map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Message { 
+  role: String, 
+  content: String,
+  #[serde(default)]
+  images: Option<Vec<ImageAttachment>>
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImageAttachment {
+  id: String,
+  name: String,
+  url: String,
+  base64: String,
+  #[serde(rename = "mimeType")]
+  mime_type: String,
+  size: u64,
+}
+
+async fn chat_once(config: AppConfig, messages: Vec<Message>, model: String, _think: bool) -> Result<String> {
+  eprintln!("[DEBUG] chat_once called with config: provider={}, baseUrl={}, apiKey={:?}", 
+    config.provider, config.base_url, config.api_key.as_ref().map(|k| format!("{}...", &k[..std::cmp::min(8, k.len())])));
+  
+  let client = Client::new();
+  let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+  eprintln!("[DEBUG] OpenAI API URL: {}", url);
+  
+  // 转换消息格式以支持图片
+  let api_messages: Vec<serde_json::Value> = messages.iter().map(|msg| {
+    if let Some(images) = &msg.images {
+      if !images.is_empty() {
+        // 有图片的消息，使用Vision API格式
+        let mut content_parts = vec![
+          serde_json::json!({
+            "type": "text",
+            "text": msg.content
+          })
+        ];
+        
+        // 添加图片内容
+        for image in images {
+          content_parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {
+              "url": format!("data:{};base64,{}", image.mime_type, image.base64)
+            }
+          }));
+        }
+        
+        serde_json::json!({
+          "role": msg.role,
+          "content": content_parts
+        })
+      } else {
+        // 无图片，使用普通格式
+        serde_json::json!({
+          "role": msg.role,
+          "content": msg.content
+        })
+      }
+    } else {
+      // 无图片，使用普通格式
+      serde_json::json!({
+        "role": msg.role,
+        "content": msg.content
+      })
+    }
+  }).collect();
+  
+  let body = serde_json::json!({
+    "model": model,
+    "messages": api_messages,
+    "stream": false,
+    "temperature": config.temperature.unwrap_or(0.6)
+  });
+  eprintln!("[DEBUG] Request body: {}", serde_json::to_string_pretty(&body).unwrap_or_default());
+  let mut req = client.post(url)
+    .header("Content-Type", "application/json")
+    .header("User-Agent", "Yao/1.0")
+    .json(&body);
+  if let Some(k) = &config.api_key {
+    if !k.is_empty() {
+      eprintln!("[DEBUG] Using API key: {}...", &k[..std::cmp::min(8, k.len())]);
+      req = req.bearer_auth(k);
+    } else {
+      eprintln!("[DEBUG] API key is empty");
+    }
+  } else {
+    eprintln!("[DEBUG] No API key provided");
+  }
+  let resp = req.send().await?;
+  let status = resp.status();
+  let text = resp.text().await?;
+  eprintln!("[DEBUG] Response status: {}", status);
+  eprintln!("[DEBUG] Response body: {}", text);
+  if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+    if let Some(content) = v
+      .get("choices")
+      .and_then(|c| c.get(0))
+      .and_then(|c| c.get("message"))
+      .and_then(|m| m.get("content"))
+      .and_then(|c| c.as_str())
+    {
+      return Ok(content.to_string());
+    }
+    if !status.is_success() {
+      let err = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or(text.as_str());
+      anyhow::bail!(err.to_string());
+    }
+  }
+  anyhow::bail!(format!("openai empty response: status={} body={}", status, text))
+}
+
+#[tauri::command]
+async fn get_log_path(_app: tauri::AppHandle) -> Result<String, String> {
+  // Prefer executable directory /logs/app.log
+  if let Ok(exe) = std::env::current_exe() {
+    if let Some(dir) = exe.parent() {
+      let p = dir.join("logs").join("app.log");
+      return Ok(p.to_string_lossy().into_owned());
+    }
+  }
+  // Fallback to app data dir
+  let base = _app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+  let p = base.join("logs").join("app.log");
+  Ok(p.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn get_conversations_path(_app: tauri::AppHandle) -> Result<String, String> {
+  if let Ok(exe) = std::env::current_exe() {
+    if let Some(dir) = exe.parent() {
+      let p = dir.join("conversations.json");
+      return Ok(p.to_string_lossy().into_owned());
+    }
+  }
+  let base = _app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+  let p = base.join("conversations.json");
+  Ok(p.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn write_log_line(_app: tauri::AppHandle, line: String) -> Result<(), String> {
+  // Use exe dir logs
+  let base = std::env::current_exe().map_err(|e| e.to_string())?;
+  let dir = base.parent().ok_or("no parent")?.join("logs");
+  std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+  let file = dir.join("app.log");
+  let mut f = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(file)
+    .map_err(|e| e.to_string())?;
+  writeln!(f, "{}", line).map_err(|e| e.to_string())?;
+  Ok(())
+}
+
+#[tauri::command]
+async fn get_config_path(_app: tauri::AppHandle) -> Result<String, String> {
+  // Always use app data directory for safety and permission compliance
+  let base = _app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+  
+  // Ensure directory exists
+  if let Err(e) = std::fs::create_dir_all(&base) {
+    eprintln!("Failed to create config directory: {}", e);
+  }
+  
+  let p = base.join("settings.json");
+  Ok(p.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn start_chat_stream(window: Window, body: String) -> Result<String, String> {
+  #[derive(Deserialize)]
+  struct InBody { config: AppConfig, messages: Vec<Message>, model: String, #[serde(default)] think: bool }
+  let parsed: InBody = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+  // simple unique id without external deps
+  let millis = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or_else(|_| std::time::Duration::from_millis(0))
+    .as_millis();
+  let stream_id = format!("stream-{}", millis);
+  let sid = stream_id.clone();
+
+  // log start
+  if let Ok(_path) = get_log_path(window.app_handle().clone()).await {
+    let _ = write_log_line(window.app_handle().clone(), format!(
+      "[chat-start] id={} model={} think={} input={}",
+      stream_id,
+      parsed.model,
+      parsed.think,
+      parsed
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .unwrap_or("")
+    ))
+    .await;
+  }
+
+  // spawn task
+  let win = window.clone();
+  tauri::async_runtime::spawn(async move {
+    match chat_once(parsed.config, parsed.messages.clone(), parsed.model.clone(), parsed.think).await {
+      Ok(content) => {
+        // emit chunks by characters batches of 8 for smoother UI
+        let mut buf = String::new();
+        for (i, ch) in content.chars().enumerate() {
+          buf.push(ch);
+          if buf.len() >= 8 || i == content.chars().count().saturating_sub(1) {
+            let _ = win.emit(&format!("chat-chunk:{}", sid), buf.clone());
+            buf.clear();
+          }
+        }
+        let _ = win.emit(&format!("chat-end:{}", sid), "");
+        let _ = write_log_line(win.app_handle().clone(), format!(
+          "[chat-end] id={} output_len={}",
+          sid,
+          content.len()
+        ))
+        .await;
+      }
+      Err(err) => {
+        let _ = win.emit(&format!("chat-error:{}", sid), err.to_string());
+        let _ = write_log_line(win.app_handle().clone(), format!(
+          "[chat-error] id={} err={}",
+          sid,
+          err.to_string()
+        ))
+        .await;
+      }
+    }
+  });
+
+  Ok(stream_id)
+}
+
+// 注释掉未使用的get_cursor_position函数
+// #[cfg(target_os = "windows")]
+// fn get_cursor_position() -> Result<(i32, i32), String> {
+//   unsafe {
+//     let mut point = POINT { x: 0, y: 0 };
+//     if GetCursorPos(&mut point).is_ok() {
+//       Ok((point.x, point.y))
+//     } else {
+//       Err("Failed to get cursor position".to_string())
+//     }
+//   }
+// }
+
+// #[cfg(not(target_os = "windows"))]
+// fn get_cursor_position() -> Result<(i32, i32), String> {
+//   Err("Cursor position detection not supported on this platform".to_string())
+// }
+
+// 设置鼠标光标位置
+#[cfg(target_os = "windows")]
+fn set_cursor_position(x: i32, y: i32) -> Result<(), String> {
+  use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+  unsafe {
+    if SetCursorPos(x, y).is_ok() {
+      Ok(())
+    } else {
+      Err("Failed to set cursor position".to_string())
+    }
+  }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_cursor_position(_x: i32, _y: i32) -> Result<(), String> {
+  Err("Cursor position setting not supported on this platform".to_string())
+}
+
+// 在指定位置点击鼠标
+#[cfg(target_os = "windows")]
+fn click_at_position(x: i32, y: i32) -> Result<(), String> {
+  use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+  use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_MOUSE, MOUSEINPUT};
+  use windows::Win32::UI::Input::KeyboardAndMouse::{MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP};
+  
+  unsafe {
+    // 设置光标位置
+    SetCursorPos(x, y).map_err(|e| format!("Failed to set cursor position: {}", e))?;
+    
+    // 创建鼠标按下事件
+    let input_down = INPUT {
+      r#type: INPUT_MOUSE,
+      Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+        mi: MOUSEINPUT {
+          dx: 0,
+          dy: 0,
+          mouseData: 0,
+          dwFlags: MOUSEEVENTF_LEFTDOWN,
+          time: 0,
+          dwExtraInfo: 0,
+        },
+      },
+    };
+    
+    // 创建鼠标释放事件
+    let input_up = INPUT {
+      r#type: INPUT_MOUSE,
+      Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+        mi: MOUSEINPUT {
+          dx: 0,
+          dy: 0,
+          mouseData: 0,
+          dwFlags: MOUSEEVENTF_LEFTUP,
+          time: 0,
+          dwExtraInfo: 0,
+        },
+      },
+    };
+    
+    // 发送按下事件
+    SendInput(&[input_down], std::mem::size_of::<INPUT>() as i32);
+    // 短暂延迟
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    // 发送释放事件
+    SendInput(&[input_up], std::mem::size_of::<INPUT>() as i32);
+    
+    Ok(())
+  }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn click_at_position(_x: i32, _y: i32) -> Result<(), String> {
+  Err("Mouse clicking not supported on this platform".to_string())
+}
+
+// Windows鼠标钩子回调函数
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn mouse_hook_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+  if n_code >= 0 {
+    // 获取当前鼠标位置
+    let mut cursor_pos = POINT { x: 0, y: 0 };
+    let _ = GetCursorPos(&mut cursor_pos);
+    let current_pos = (cursor_pos.x, cursor_pos.y);
+    
+    // 检查修饰键状态
+    let ctrl_pressed = GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 != 0;
+    
+    match w_param.0 as u32 {
+      // 左键按下 - 检查修饰键
+      WM_LBUTTONDOWN => {
+        // Ctrl+左键 - 快速输入
+        if ctrl_pressed {
+          println!("🎯 Ctrl+Left Click detected!");
+          
+          println!("📍 Mouse position: ({}, {})", current_pos.0, current_pos.1);
+          
+          // 存储光标位置
+          let cursor_pos_storage = CURSOR_POSITION.get_or_init(|| Arc::new(Mutex::new(None)));
+          if let Ok(mut pos) = cursor_pos_storage.lock() {
+            *pos = Some(current_pos);
+          }
+          
+          // 获取应用句柄并显示快速输入窗口
+          if let Some(app_handle_storage) = APP_HANDLE.get() {
+            if let Ok(app_handle_opt) = app_handle_storage.lock() {
+              if let Some(app_handle) = app_handle_opt.as_ref() {
+                let app_clone = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                  println!("📝 Starting to show quick input window from mouse hook...");
+                  if let Err(e) = show_quick_input_window(app_clone).await {
+                    eprintln!("❌ Failed to show quick input window: {}", e);
+                  } else {
+                    println!("✅ Quick input window command completed successfully");
+                  }
+                });
+              }
+            }
+          }
+          
+          // 阻止默认的鼠标点击行为，防止误操作
+          return LRESULT(1);
+        }
+      }
+      
+      _ => {}
+    }
+  }
+  
+  CallNextHookEx(None, n_code, w_param, l_param)
+}
+
+// 设置全局鼠标钩子
+#[cfg(target_os = "windows")]
+fn setup_mouse_hook() -> Result<(), String> {
+  unsafe {
+    let h_instance = GetModuleHandleW(None).map_err(|e| format!("Failed to get module handle: {}", e))?;
+    let hook = SetWindowsHookExW(
+      WH_MOUSE_LL,
+      Some(mouse_hook_proc),
+      HINSTANCE(h_instance.0),
+      0
+    ).map_err(|e| format!("Failed to set mouse hook: {}", e))?;
+    
+    if hook.is_invalid() {
+      return Err("Failed to install mouse hook".to_string());
+    }
+    
+    println!("✅ Global mouse hook installed successfully");
+    Ok(())
+  }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn setup_mouse_hook() -> Result<(), String> {
+  Err("Mouse hook not supported on this platform".to_string())
+}
+
+// 计算智能窗口位置
+#[cfg(target_os = "windows")]
+fn calculate_smart_position(mouse_x: i32, mouse_y: i32, window_width: i32, window_height: i32) -> Result<(i32, i32), String> {
+  unsafe {
+    let screen_width = GetSystemMetrics(SM_CXSCREEN);
+    let screen_height = GetSystemMetrics(SM_CYSCREEN);
+    
+    println!("📐 Screen size: {}x{}, Mouse: ({}, {}), Window: {}x{}", 
+             screen_width, screen_height, mouse_x, mouse_y, window_width, window_height);
+    
+    let margin = 20; // 边距
+    let mut x = mouse_x + margin; // 默认显示在鼠标右边
+    let mut y = mouse_y - (window_height / 2); // 垂直居中
+    
+    // 检查右边界，如果超出则显示在左边
+    if x + window_width > screen_width - margin {
+      x = mouse_x - window_width - margin;
+      println!("🔄 Adjusted to left side due to right boundary");
+    }
+    
+    // 检查左边界
+    if x < margin {
+      x = margin;
+      println!("🔄 Adjusted to margin due to left boundary");
+    }
+    
+    // 检查下边界，如果超出则显示在上面
+    if y + window_height > screen_height - margin {
+      y = mouse_y - window_height - margin;
+      println!("🔄 Adjusted to top due to bottom boundary");
+    }
+    
+    // 检查上边界
+    if y < margin {
+      y = margin;
+      println!("🔄 Adjusted to margin due to top boundary");
+    }
+    
+    println!("✅ Final position: ({}, {})", x, y);
+    Ok((x, y))
+  }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn calculate_smart_position(mouse_x: i32, mouse_y: i32, window_width: i32, window_height: i32) -> Result<(i32, i32), String> {
+  // 非Windows平台的简单实现
+  let margin = 20;
+  let x = mouse_x + margin;
+  let y = mouse_y - (window_height / 2);
+  Ok((x, y))
+}
+
+// 新的截图功能
+#[tauri::command]
+async fn start_screenshot() -> Result<(), String> {
+  println!("🖼️ Starting system screenshot...");
+  
+  // 获取应用句柄
+  if let Some(app_handle_storage) = APP_HANDLE.get() {
+    if let Ok(app_handle_opt) = app_handle_storage.lock() {
+      if let Some(app_handle) = app_handle_opt.as_ref() {
+        let app_clone = app_handle.clone();
+        
+        // 异步执行截图
+        tauri::async_runtime::spawn(async move {
+          match capture_full_screen().await {
+            Ok(screenshot_data) => {
+              // 发送截图数据到前端
+              let event_data = serde_json::json!({
+                "success": true,
+                "imageData": screenshot_data.base64_data,
+                "width": screenshot_data.width,
+                "height": screenshot_data.height
+              });
+              
+              if let Err(e) = app_clone.emit("screenshot-captured", event_data) {
+                println!("❌ Failed to emit screenshot event: {}", e);
+              } else {
+                println!("✅ Screenshot captured and sent to frontend");
+              }
+            }
+            Err(e) => {
+              println!("❌ Screenshot failed: {}", e);
+              let error_data = serde_json::json!({
+                "success": false,
+                "error": e
+              });
+              let _ = app_clone.emit("screenshot-captured", error_data);
+            }
+          }
+        });
+      }
+    }
+  }
+  
+  Ok(())
+}
+
+#[derive(Debug)]
+struct ScreenshotData {
+  base64_data: String,
+  width: u32,
+  height: u32,
+}
+
+async fn capture_full_screen() -> Result<ScreenshotData, String> {
+  println!("📸 Capturing full screen...");
+  
+  // 获取主显示器
+  let monitors = Monitor::all().map_err(|e| format!("Failed to get monitors: {}", e))?;
+  let primary_monitor = monitors.into_iter().next().ok_or("No monitor found")?;
+  
+  println!("🖥️ Monitor info: {}x{}", primary_monitor.width(), primary_monitor.height());
+  
+  // 截取屏幕
+  let image = primary_monitor.capture_image().map_err(|e| format!("Failed to capture screen: {}", e))?;
+  
+  // 转换为PNG字节数据
+  let mut png_data = Vec::new();
+  {
+    use std::io::Cursor;
+    let mut cursor = Cursor::new(&mut png_data);
+    image.write_to(&mut cursor, ImageFormat::Png)
+      .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+  }
+  
+  // 转换为base64
+  let base64_data = general_purpose::STANDARD.encode(&png_data);
+  
+  println!("✅ Screenshot captured: {}x{}, size: {} bytes", 
+           image.width(), image.height(), png_data.len());
+  
+  Ok(ScreenshotData {
+    base64_data,
+    width: image.width(),
+    height: image.height(),
+  })
+}
+
+#[tauri::command]
+async fn save_screenshot_area(
+  image_data: String,
+  x: u32,
+  y: u32,
+  width: u32,
+  height: u32
+) -> Result<String, String> {
+  println!("💾 Saving screenshot area: x={}, y={}, width={}, height={}", x, y, width, height);
+  
+  // 解码base64图片数据
+  let image_bytes = general_purpose::STANDARD
+    .decode(&image_data)
+    .map_err(|e| format!("Failed to decode base64: {}", e))?;
+  
+  // 加载图片
+  let img = image::load_from_memory(&image_bytes)
+    .map_err(|e| format!("Failed to load image: {}", e))?;
+  
+  // 裁剪图片
+  let cropped = img.crop_imm(x, y, width, height);
+  
+  // 转换为PNG字节数组
+  let mut output = Vec::new();
+  {
+    use std::io::Cursor;
+    let mut cursor = Cursor::new(&mut output);
+    cropped.write_to(&mut cursor, ImageFormat::Png)
+      .map_err(|e| format!("Failed to write PNG: {}", e))?;
+  }
+  
+  // 转换为base64
+  let base64_result = general_purpose::STANDARD.encode(&output);
+  
+  println!("✅ Screenshot area saved, size: {} bytes", output.len());
+  Ok(base64_result)
+}
+
+#[tauri::command]
+async fn simulate_text_input(text: String) -> Result<(), String> {
+  println!("🔤 Starting text input simulation: {}", text);
+  
+  // 短暂延迟确保窗口隐藏完成
+  tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+  
+  // 获取记录的光标位置
+  let cursor_pos = CURSOR_POSITION.get_or_init(|| Arc::new(Mutex::new(None)));
+  let saved_position = if let Ok(pos) = cursor_pos.lock() {
+    *pos
+  } else {
+    None
+  };
+  
+  // 如果有保存的光标位置，先设置到该位置并点击
+  if let Some((x, y)) = saved_position {
+    println!("🎯 Moving cursor to saved position: ({}, {})", x, y);
+    if let Err(e) = set_cursor_position(x, y) {
+      println!("⚠️ Failed to set cursor position: {}", e);
+    }
+    
+    // 点击一下确保焦点和激活文本输入位置
+    println!("🖱️ Clicking at cursor position to activate");
+    if let Err(e) = click_at_position(x, y) {
+      println!("⚠️ Failed to click at position: {}", e);
+    }
+    
+    // 等待点击生效
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+  } else {
+    println!("⚠️ No saved cursor position found");
+  }
+  
+  let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+  
+  // 逐字符输入，支持中文
+  for char in text.chars() {
+    if char == '\n' {
+      enigo.key(Key::Return, enigo::Direction::Click).map_err(|e| e.to_string())?;
+    } else {
+      enigo.text(&char.to_string()).map_err(|e| e.to_string())?;
+    }
+    // 短暂延迟模拟自然打字
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+  }
+  
+  println!("✅ Text input simulation completed");
+  Ok(())
+}
+
+#[tauri::command]
+async fn show_quick_input_window(app: tauri::AppHandle) -> Result<(), String> {
+  println!("🔍 show_quick_input_window called");
+  
+  // 获取保存的鼠标位置
+  let cursor_pos = CURSOR_POSITION.get_or_init(|| Arc::new(Mutex::new(None)));
+  let saved_position = if let Ok(pos) = cursor_pos.lock() {
+    *pos
+  } else {
+    None
+  };
+  
+  if let Some(window) = app.get_webview_window("quick-input") {
+    println!("✅ Found existing quick-input window, showing it");
+    
+    // 如果有鼠标位置，计算智能定位
+    if let Some((mouse_x, mouse_y)) = saved_position {
+      if let Ok(position) = calculate_smart_position(mouse_x, mouse_y, 740, 100) {
+        println!("📍 Setting window position to: ({}, {})", position.0, position.1);
+        if let Err(e) = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x: position.0, y: position.1 })) {
+          println!("⚠️ Failed to set window position: {}", e);
+        }
+      }
+    }
+    
+    match window.show() {
+      Ok(_) => println!("✅ Existing window.show() successful"),
+      Err(e) => {
+        println!("❌ Existing window.show() failed: {}", e);
+        return Err(e.to_string());
+      }
+    }
+    match window.set_focus() {
+      Ok(_) => println!("✅ Existing window.set_focus() successful"),
+      Err(e) => {
+        println!("❌ Existing window.set_focus() failed: {}", e);
+        return Err(e.to_string());
+      }
+    }
+  } else {
+    println!("🔨 Creating new quick-input window");
+    println!("📍 Window URL: quick-input.html");
+    println!("📐 Window size: 740x100, transparent: true, always_on_top: true");
+    
+    // 如果窗口不存在，创建新窗口
+    let mut window_builder = tauri::WebviewWindowBuilder::new(
+      &app,
+      "quick-input",
+      tauri::WebviewUrl::App("quick-input.html".into())
+    )
+    .title("Yao Quick Input")
+    .inner_size(740.0, 100.0)
+    .resizable(false)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true);
+    
+    // 如果有鼠标位置，使用智能定位，否则居中
+    if let Some((mouse_x, mouse_y)) = saved_position {
+      if let Ok(position) = calculate_smart_position(mouse_x, mouse_y, 740, 100) {
+        println!("📍 Creating window at smart position: ({}, {})", position.0, position.1);
+        window_builder = window_builder.position(position.0 as f64, position.1 as f64);
+      } else {
+        window_builder = window_builder.center();
+      }
+    } else {
+      window_builder = window_builder.center();
+    }
+    
+    let window = window_builder.build()
+    .map_err(|e| {
+      println!("❌ Failed to create quick-input window: {}", e);
+      e.to_string()
+    })?;
+    
+    println!("✅ Quick-input window created successfully");
+    
+    match window.show() {
+      Ok(_) => println!("✅ New window.show() successful"),
+      Err(e) => {
+        println!("❌ New window.show() failed: {}", e);
+        return Err(e.to_string());
+      }
+    }
+    
+    match window.set_focus() {
+      Ok(_) => println!("✅ New window.set_focus() successful"),
+      Err(e) => {
+        println!("❌ New window.set_focus() failed: {}", e);
+        return Err(e.to_string());
+      }
+    }
+  }
+  
+  println!("🎉 show_quick_input_window completed successfully");
+  Ok(())
+}
+
+#[tauri::command]
+async fn register_global_shortcut(_app: tauri::AppHandle) -> Result<(), String> {
+  // 全局快捷键已在 setup 中注册，这个命令主要用于前端确认注册状态
+  Ok(())
+}
+
+#[tauri::command]
+async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+  if let Some(window) = app.get_webview_window("main") {
+    window.show().map_err(|e| e.to_string())?;
+    window.set_focus().map_err(|e| e.to_string())?;
+    window.unminimize().map_err(|e| e.to_string())?;
+  }
+  Ok(())
+}
+
+#[tauri::command]
+async fn hide_main_window(app: tauri::AppHandle) -> Result<(), String> {
+  if let Some(window) = app.get_webview_window("main") {
+    window.hide().map_err(|e| e.to_string())?;
+  }
+  Ok(())
+}
+
+fn setup_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+  let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+  let hide_item = MenuItem::with_id(app, "hide", "隐藏到托盘", true, None::<&str>)?;
+  let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+  let menu = Menu::with_items(app, &[&show_item, &hide_item, &quit_item])?;
+
+  let _tray = TrayIconBuilder::with_id("main-tray")
+    .menu(&menu)
+    .tooltip("Yao - AI聊天助手")
+    .icon(app.default_window_icon().unwrap().clone())
+    .on_menu_event(move |app, event| {
+      match event.id.as_ref() {
+        "show" => {
+          if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+            let _ = window.unminimize();
+          }
+        }
+        "hide" => {
+          if let Some(window) = app.get_webview_window("main") {
+            let _ = window.hide();
+          }
+        }
+        "quit" => {
+          app.exit(0);
+        }
+        _ => {}
+      }
+    })
+    .on_tray_icon_event(|tray, event| {
+      if let tauri::tray::TrayIconEvent::Click {
+        button: tauri::tray::MouseButton::Left,
+        button_state: tauri::tray::MouseButtonState::Up,
+        ..
+      } = event {
+        let app = tray.app_handle();
+        if let Some(window) = app.get_webview_window("main") {
+          if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+          } else {
+            let _ = window.show();
+            let _ = window.set_focus();
+            let _ = window.unminimize();
+          }
+        }
+      }
+    })
+    .build(app)?;
+
+  Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+  tauri::Builder::default()
+    .plugin(tauri_plugin_store::Builder::new().build())
+    .plugin(tauri_plugin_process::init())
+    .plugin(tauri_plugin_shell::init())
+    .plugin(tauri_plugin_fs::init())
+    .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+    .setup(|app| {
+      println!("🚀 Setting up application...");
+      
+      // 存储应用句柄供鼠标钩子使用
+      let app_handle = app.handle().clone();
+      let app_handle_storage = APP_HANDLE.get_or_init(|| Arc::new(Mutex::new(None)));
+      if let Ok(mut handle) = app_handle_storage.lock() {
+        *handle = Some(app_handle);
+      }
+      
+      // 设置全局鼠标钩子 (Ctrl+鼠标左键)
+      println!("🖱️ Setting up global mouse hook for Ctrl+Left Click...");
+      match setup_mouse_hook() {
+        Ok(_) => println!("✅ Global mouse hook set up successfully"),
+        Err(e) => {
+          println!("⚠️ Failed to set up mouse hook: {}", e);
+          println!("⚠️ Ctrl+Left Click functionality will not be available");
+        }
+      }
+
+      // 设置全局截图快捷键 (Ctrl+Alt+A)
+      println!("⌨️ Setting up global screenshot shortcut...");
+      let app_handle_for_shortcut = app.handle().clone();
+      if let Err(e) = app.global_shortcut().register("Ctrl+Alt+A") {
+        println!("⚠️ Failed to register screenshot shortcut: {}", e);
+      } else {
+        println!("✅ Screenshot shortcut (Ctrl+Alt+A) registered successfully");
+        
+        // 监听快捷键事件
+        let app_clone = app_handle_for_shortcut.clone();
+        let _ = app.global_shortcut().on_shortcut("Ctrl+Alt+A", move |_, _, _| {
+          println!("📸 Screenshot shortcut triggered!");
+          let app_inner = app_clone.clone();
+          tauri::async_runtime::spawn(async move {
+            // 发送快捷键事件到前端
+            if let Err(e) = app_inner.emit("shortcut", "Ctrl+Alt+A") {
+              println!("❌ Failed to emit shortcut event: {}", e);
+            }
+          });
+        });
+      }
+      
+      // 设置系统托盘
+      println!("🖥️ Setting up system tray...");
+      setup_system_tray(&app)?;
+      
+      println!("🎉 Application setup completed successfully");
+      Ok(())
+    })
+    .invoke_handler(tauri::generate_handler![
+      proxy_models,
+      proxy_chat_stream,
+      proxy_chat,
+      get_log_path,
+      write_log_line,
+      get_config_path,
+      get_conversations_path,
+      start_chat_stream,
+      simulate_text_input,
+      show_quick_input_window,
+      register_global_shortcut,
+      show_main_window,
+      hide_main_window,
+      start_screenshot,
+      save_screenshot_area
+    ])
+    .run(tauri::generate_context!())
+    .expect("error while running tauri application");
+}

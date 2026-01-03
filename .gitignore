@@ -1,0 +1,109 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+python_env/
+ENV/
+env/
+
+# YaoScope Service Runtime
+# 注意：只缓存有复用价值的文件（plans、tasks、ace_knowledge）
+YaoScope/service/data/
+YaoScope/service_stdout.log
+YaoScope/service_stderr.log
+YaoScope/service_output.log
+
+# Local config (contains API keys) - never commit
+config/settings.json
+config/settings*.local.json
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Cursor / agent artifacts (local only)
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Large/binary artifacts (never commit)
+*.ppt
+*.pptx
+*.pdf
+*.mp4
+*.7z
+*.rar
+*.exe
+*.msi
+
+# Screenshots and test images
+YaoScope/data/screenshots/
+
+# Models - Large files that should be downloaded separately
+models/*.gguf
+models/paddleocr/
+models/paddlex/
+AgenticService-old/models/
+
+# Test outputs and temporary data
+YaoScope/test_output.txt
+YaoScope/test_latest.txt
+YaoScope/data/planscope/
+AgenticService-old/data/
+*.db
+*.sqlite3
+
+# Old/deprecated directories
+AgenticService-old/
+
+# Rust
+target/
+
+# Tauri build outputs
+src-tauri/target/
+src-tauri/logs/
+
+# Node modules (if any)
+node_modules/
+
+# Publish/Release builds
+publish/
+*.zip
+
+# Legacy/contest materials (never commit)
+决赛文档/
+
+# Local history-rewrite helper (never commit)
+_filter_index.sh

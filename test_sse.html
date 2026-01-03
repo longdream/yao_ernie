@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SSE 测试</title>
+    <meta charset="UTF-8">
+</head>
+<body>
+    <h1>SSE 进度测试</h1>
+    <div id="status">等待连接...</div>
+    <div id="messages"></div>
+    
+    <script>
+        const sessionId = `session_${Date.now()}`;
+        console.log('Session ID:', sessionId);
+        
+        const eventSource = new EventSource(`http://localhost:8765/agent/progress/${sessionId}`);
+        
+        eventSource.onopen = () => {
+            document.getElementById('status').textContent = '✅ SSE 连接已建立';
+            console.log('SSE 连接已建立');
+        };
+        
+        eventSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            console.log('收到消息:', data);
+            
+            const messagesDiv = document.getElementById('messages');
+            const p = document.createElement('p');
+            p.textContent = JSON.stringify(data, null, 2);
+            messagesDiv.appendChild(p);
+            
+            if (data.done || data.timeout) {
+                document.getElementById('status').textContent = '🏁 连接已关闭';
+                eventSource.close();
+            }
+        };
+        
+        eventSource.onerror = (error) => {
+            console.error('SSE 错误:', error);
+            document.getElementById('status').textContent = '❌ 连接错误';
+        };
+        
+        // 10秒后发送一个测试请求
+        setTimeout(async () => {
+            console.log('发送测试请求...');
+            const response = await fetch('http://localhost:8765/agent/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    app_name: '测试',
+                    prompt: '测试消息',
+                    session_id: sessionId
+                })
+            });
+            const result = await response.json();
+            console.log('响应:', result);
+        }, 2000);
+    </script>
+</body>
+</html>
+

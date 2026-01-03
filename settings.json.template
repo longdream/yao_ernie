@@ -1,0 +1,55 @@
+{
+  "provider": "openai",
+  "baseUrl": "https://api.openai.com/v1",
+  "apiKey": "your-api-key-here",
+  "model": null,
+  "models": [
+    {
+      "name": "PaddlePaddle/ERNIE-4.5-0.3B-Paddle",
+      "provider": "openai",
+      "baseUrl": "https://api-feh3mbo3u8zbd2p0.aistudio-app.com/v1",
+      "category": "light",
+      "supportsVision": false,
+      "apiKey": "your-light-model-api-key"
+    },
+    {
+      "name": "baidu/ERNIE-4.5-300B-A47B",
+      "provider": "openai",
+      "baseUrl": "https://api.siliconflow.cn/v1",
+      "category": "advanced",
+      "supportsVision": false,
+      "apiKey": "your-advanced-model-api-key"
+    },
+    {
+      "name": "PaddlePaddle/ERNIE-4.5-21B-A3B-Thinking",
+      "provider": "openai",
+      "baseUrl": "https://api-vdvdnft0fd7fv6m4.aistudio-app.com/v1",
+      "category": "advanced",
+      "supportsVision": false,
+      "apiKey": "your-thinking-model-api-key"
+    },
+    {
+      "name": "PaddlePaddle/ERNIE-4.5-VL-28B-A3B-Paddle",
+      "provider": "openai",
+      "baseUrl": "https://api-dadfy0f0tfras900.aistudio-app.com/v1",
+      "category": "vl",
+      "supportsVision": true,
+      "apiKey": "your-vl-model-api-key"
+    }
+  ],
+  "vlModel": "PaddlePaddle/ERNIE-4.5-VL-28B-A3B-Paddle",
+  "lightModel": "PaddlePaddle/ERNIE-4.5-0.3B-Paddle",
+  "advancedModel": "PaddlePaddle/ERNIE-4.5-21B-A3B-Thinking",
+  "streamingEnabled": true,
+  "defaultThink": false,
+  "maxContextMessages": 20,
+  "temperature": 0.7,
+  "language": "zh-CN",
+  "mcpServers": [],
+  "mcpServerInfos": {},
+  "mcpMaxRetries": 3,
+  "mcpReflectionEnabled": true,
+  "embeddingUrl": "http://localhost:8766",
+  "embeddingModel": "",
+  "embeddingApiKey": ""
+}

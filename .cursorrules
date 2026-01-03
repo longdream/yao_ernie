@@ -1,0 +1,111 @@
+# Cursor 强制规范 —— 违反即 BLOCKING 错误
+
+## 1. 主线零降级  
+禁止任何 fallback、backup、failover、降级、回退代码。主线必须 100% 可用。
+
+## 2. 修改后必运行  
+任何文件保存后 → 立即执行 `start.bat` → 必须打印 `=== START SUCCESS ===` 且返回 0，否则禁止继续。
+
+## 3. Rust ↔ Python 双检  
+a) 改完 *.py → 先本地 `python <文件>` 带配置跑通。  
+b) 再 `cargo test` 对应 Rust 调用项，必须全绿。两步任一失败立即修复。
+
+## 4. 界面强制双语  
+所有用户可见文本必须同时存在 zh-CN、en-US 两种翻译，缺失即编译失败。
+
+## 5. Agentic 仅 Python  
+所有 agent/agentic 逻辑只能写在 **YaoScope** Python服务中，并通过 Python HTTP 服务（8765）暴露；Rust 禁止出现任何 agent 代码。
+
+> **重要**: YaoScope 是唯一的 Python 后端服务，已完全替代旧的 `python_service` 和 `AgenticService`。
+
+## 6. 服务架构
+- **前端**: Tauri (Rust) + React
+- **后端**: YaoScope (Python HTTP服务，端口8765)
+- **核心引擎**: PlanScope - 工作流驱动的智能执行引擎
+- **通信方式**: HTTP/REST API
+
+## 7. Python依赖管理
+Python的依赖必须添加到 `YaoScope/requirements.txt` 中，便于后期部署安装。不允许直接 pip install 而不更新requirements.txt。
+
+## 8. Python文件组织
+所有的Python文件应该放到 `YaoScope` 目录中：
+- `YaoScope/service/` - HTTP服务代码
+- `YaoScope/planscope/` - PlanScope核心
+- `YaoScope/tools/` - 工具实现
+- ~~不要放入 python_env 或其他临时目录~~
+
+## 9. 模型文件
+Embedding模型已保存在 `models/` 目录中，不应该下载。大型模型文件不要提交到git。
+
+## 10. Clean Code
+整个项目都需要保持clean code原则：
+- 代码简洁易读
+- 函数职责单一
+- 避免重复代码
+- 有意义的命名
+
+## 11. 服务日志
+不要总检查进程或端口是否存在。如果服务启动或未启动，直接看日志即可：
+- `YaoScope/service/logs/` - 服务日志
+- `YaoScope/service_output.log` - 输出日志
+
+## 12. AgentScope问题
+如果遇到AgentScope相关问题，使用Context7查找官方文档。
+
+## 13. 零硬编码原则 ⭐
+**最重要的规则**：不能有任何硬编码和关键词判断来代替LLM判断。
+
+- ❌ 禁止: `if "微信" in text: ...`
+- ❌ 禁止: `if task_type == "chat": ...`
+- ❌ 禁止: 固定的工具选择规则
+- ✅ 正确: 通过详细的工具描述引导LLM
+- ✅ 正确: LLM根据任务自主推理和决策
+- ✅ 正确: 所有特殊规则写在工具的TOOL_DESCRIPTION中
+
+### 示例
+```python
+# ❌ 错误 - 硬编码判断
+if "微信" in app_name or "聊天" in prompt:
+    use_chat_recognition_rules()
+
+# ✅ 正确 - 通过工具描述引导LLM
+TOOL_DESCRIPTION = """
+...
+微信/QQ聊天界面识别规则（重要）：
+- 消息气泡贴左边（左对齐）= 对方发送的消息
+- 消息气泡贴右边（右对齐）= 我发送的消息
+...
+"""
+```
+
+## 14. 目录结构
+```
+yao/
+├── src/              # Tauri前端 (React + TypeScript)
+├── src-tauri/        # Tauri Rust后端
+├── YaoScope/         # Python智能服务 (唯一后端)
+│   ├── service/      # HTTP服务
+│   ├── planscope/    # PlanScope核心
+│   ├── tools/        # 工具实现
+│   └── venv/         # Python虚拟环境
+├── models/           # 本地模型文件 (不提交git)
+└── start.bat         # 启动脚本
+```
+
+## 15. 启动流程
+1. `start.bat` 检查 YaoScope/venv
+2. 安装/更新 YaoScope 依赖
+3. 启动 YaoScope HTTP服务 (端口8765)
+4. 启动 Tauri 开发服务器
+5. 打印 `=== START SUCCESS ===`
+
+## 16. 提交规范
+- 提交前确保 `start.bat` 能够成功运行
+- 不要提交大型模型文件 (*.gguf, *.pdiparams等)
+- 不要提交临时数据 (screenshots, logs, *.db等)
+- 确保 .gitignore 正确配置
+
+---
+
+**违反以上任何规则都是 BLOCKING 错误，必须立即修复！**
+

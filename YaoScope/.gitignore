@@ -1,0 +1,51 @@
+# PyInstaller 打包相关
+build/
+dist/
+*.spec.bak
+
+# Python 编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# 数据和日志
+data/
+logs/
+*.log
+*.db
+
+# 模型文件（太大不提交）
+models/*.gguf
+models/*.pdiparams
+models/*.pdmodel
+models/*.pdopt
+
+# 临时文件
+*.tmp
+*.bak
+.pytest_cache/
+.coverage
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 截图和测试数据
+screenshots/
+test_data/
+imagetarget/
+
+# 运行时数据
+runs/
+service/data/
+service/runs/
+
+
